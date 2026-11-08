@@ -1,7 +1,8 @@
-// Scanner: the badge opens an OPEN SoftAP. Any device that joins is listed and
-// port-scanned by the badge. The verdict (SECURE / AT RISK) is shown on the badge
-// e-ink (kept there) and mirrored to the phone via a captive portal.
-// In scope: only scans devices that chose to connect to the badge own AP.
+// Scanner: the badge opens an OPEN SoftAP. Every device that joins is port-scanned
+// by the badge, ranked by a RISK SCORE (a leaderboard, most-risky on top), and the
+// result is shown on the badge e-ink and mirrored to the phone via a captive portal.
+// When no devices are connected, the badge advertises ZTLP (zero-trust / minimize
+// your attack surface). In scope: only scans devices that chose to join the AP.
 #include <string.h>
 #include <stdio.h>
 #include "badge.h"
@@ -17,11 +18,13 @@
 #define ADDR "192.168.4.1"
 #define MAXC 8
 #define SCAN_PORTS 24
-static const int scan_ports[SCAN_PORTS] = {
-    21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 161, 389, 443, 445,
-    587, 631, 993, 995, 1433, 3306, 5432, 8080, 8443
+// ports we probe; weight = how risky it is that it is open
+typedef struct { int port; int w; } sport_t;
+static const sport_t scan_ports[SCAN_PORTS] = {
+    {21,12},{22,4},{23,14},{25,8},{53,5},{80,6},{110,8},{111,7},
+    {135,12},{139,12},{143,8},{161,6},{389,8},{443,2},{445,14},
+    {587,6},{631,5},{993,8},{995,8},{1433,10},{3306,10},{5432,10},{8080,10},{8443,10},
 };
-static const int risky_ports[] = {21, 23, 135, 139, 445, 5900, 5985, 8080, 8443, 3389};
 
 typedef struct {
     uint8_t ip[4];
@@ -29,16 +32,13 @@ typedef struct {
     int known;
     int open[SCAN_PORTS];
     int n_open;
-    int at_risk;
+    int score;        // risk score (higher = riskier)
 } client_t;
 
 static client_t cl[ MAXC ];
-static char pagebuf[4096];
+static char pagebuf[4608];
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
-static void mac_str(const uint8_t m[6], char *out) {
-    snprintf(out, 18, "%02x:%02x:%02x:%02x:%02x:%02x", m[0],m[1],m[2],m[3],m[4],m[5]);
-}
 static void ip_str(const uint8_t ip[4], char *out) {
     snprintf(out, 16, "%u.%u.%u.%u", ip[0],ip[1],ip[2],ip[3]);
 }
@@ -58,7 +58,6 @@ static void refresh_clients(void) {
     }
 }
 
-// TCP connect probe with a short timeout
 static int probe(const uint8_t ip[4], int port) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return 0;
@@ -73,14 +72,33 @@ static int probe(const uint8_t ip[4], int port) {
 }
 
 static void scan_client(client_t *c) {
-    c->n_open = 0;
-    for (int i = 0; i < SCAN_PORTS; i++)
-        if (probe(c->ip, scan_ports[i])) c->open[c->n_open++] = scan_ports[i];
-    c->at_risk = 0;
-    for (int i = 0; i < c->n_open; i++)
-        for (size_t j = 0; j < sizeof risky_ports/sizeof risky_ports[0]; j++)
-            if (c->open[i] == risky_ports[j]) c->at_risk = 1;
-    if (c->n_open >= 5) c->at_risk = 1;
+    c->n_open = 0; c->score = 0;
+    for (int i = 0; i < SCAN_PORTS; i++) {
+        if (probe(c->ip, scan_ports[i].port)) {
+            c->open[c->n_open++] = scan_ports[i].port;
+            c->score += scan_ports[i].w;          // add the port's weight to the score
+        }
+    }
+    if (c->n_open >= 5) c->score += 15;           // bonus: a lot of services open
+}
+
+// leaderboard order: highest score first (stable by IP on ties).
+// rank = 0 is the most-risky device.
+static int leader_idx(int rank) {
+    int order[MAXC], n = 0;
+    for (int i = 0; i < MAXC; i++) if (cl[i].known) order[n++] = i;
+    // selection sort by score desc, tie-break by IP asc
+    for (int i = 0; i < n; i++) {
+        int best = i;
+        for (int j = i + 1; j < n; j++) {
+            if (cl[order[j]].score > cl[order[best]].score ||
+                (cl[order[j]].score == cl[order[best]].score &&
+                 memcmp(cl[order[j]].ip, cl[order[best]].ip, 4) < 0))
+                best = j;
+        }
+        int t = order[i]; order[i] = order[best]; order[best] = t;
+    }
+    return (rank < n) ? order[rank] : -1;
 }
 
 // captive-portal DNS: every A query answers with the badge IP
@@ -105,72 +123,111 @@ static void dns_task(void *arg) {
     }
 }
 
+// the phone page: a leaderboard table (score, IP, ports) + the ZTLP ad
 static void build_page(void) {
-    int any_risk = 0, live = 0;
-    for (int i=0;i<MAXC;i++) if (cl[i].known) { live++; if (cl[i].at_risk) any_risk=1; }
-    const char *cls = any_risk ? "bad" : "ok";
-    const char *verdict = any_risk ? "AT RISK" : "SECURE";
+    int live = 0, top = -1;
+    for (int i=0;i<MAXC;i++) if (cl[i].known) { live++; if (cl[i].score > (top<0? -1: cl[top].score)) top=i; }
+    const char *verdict = (top<0 || cl[top].score<10) ? "LOW RISK" : (cl[top].score<40 ? "MODERATE" : "HIGH RISK");
     char *p = pagebuf;
     p += snprintf(p, sizeof pagebuf-(size_t)(p-pagebuf),
         "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<title>Badge security scan</title><style>body{font:16px system-ui;background:#111;color:#eee;margin:24px}"
-        ".v{font-size:44px;font-weight:700}.ok{color:#5fd06b}.bad{color:#ff5a5a}"
-        ".c{border:1px solid #444;border-radius:10px;padding:12px;margin:12px 0}.h{font-size:13px;color:#999}"
-        ".o{color:#ff9f43}.s{color:#5fd06b}</style>"
-        "<h2>Badge security scan</h2>"
-        "<div class=v %s>%s</div>"
-        "<p>%d device(s) connected to this badge.</p>",
-        cls, verdict, live);
-    for (int i=0;i<MAXC;i++) if (cl[i].known) {
-        char ip[16], mac[18];
-        const char *oc = cl[i].at_risk ? "o" : "s";
-        ip_str(cl[i].ip, ip); mac_str(cl[i].mac, mac);
+        "<title>Badge risk scoreboard</title><style>body{font:15px system-ui;background:#111;color:#eee;margin:20px}"
+        ".v{font-size:42px;font-weight:700}.low{color:#5fd06b}.mod{color:#ff9f43}.high{color:#ff5a5a}"
+        "table{width:100%;border-collapse:collapse}th,td{border:1px solid #333;padding:8px;text-align:left}"
+        ".r{color:#ff5a5a;font-weight:700}.m{color:#ff9f43}.s{color:#5fd06b}"
+        ".z{margin-top:26px;border:1px solid #2a6;padding:14px;border-radius:10px;background:#0c2418}"
+        ".z b{font-size:20px}.o{color:#ff9f43}</style>"
+        "<h2>Badge risk scoreboard</h2><div class=v %s>%s</div><p>%d device(s) on this badge, ranked by risk.</p>"
+        "<table><tr><th>#</th><th>Risk</th><th>Device</th><th>Open ports</th></tr>",
+        (top<0||cl[top].score<10)?"low":(cl[top].score<40?"mod":"high"), verdict, live);
+    int rank=0;
+    for (int r=0;r<MAXC;r++) {
+        int i = leader_idx(r);
+        if (i<0) break;
+        rank++;
+        const char *cls = cl[i].score<10 ? "s" : (cl[i].score<40 ? "m" : "r");
+        char ip[16]; ip_str(cl[i].ip, ip);
         p += snprintf(p, sizeof pagebuf-(size_t)(p-pagebuf),
-            "<div class=c><div class=h>%s  %s</div><div class=%s>%d open port(s)</div>",
-            ip, mac, oc, cl[i].n_open);
+            "<tr><td>%d</td><td class=%s>%d</td><td>%s</td><td>", rank, cls, cl[i].score, ip);
         for (int k=0;k<cl[i].n_open;k++)
             p += snprintf(p, sizeof pagebuf-(size_t)(p-pagebuf), "<span class=o>%d</span> ", cl[i].open[k]);
-        p += snprintf(p, sizeof pagebuf-(size_t)(p-pagebuf), "</div>");
+        p += snprintf(p, sizeof pagebuf-(size_t)(p-pagebuf), "</td></tr>");
     }
     p += snprintf(p, sizeof pagebuf-(size_t)(p-pagebuf),
-        "<p class=h>Rescanning every 10s. Open ports are services reachable on this badge AP.</p>");
+        "</table>"
+        "<div class=z><b>ZTLP</b> &mdash; Secure Identity-First Network Overlay.<br>"
+        "Authenticating every device before it gets network access shrinks your attack surface: "
+        "unauthorized traffic is rejected before it costs anything. <b>Minimize your attack surface.</b>"
+        "</div>");
 }
 
 static esp_err_t get_page(httpd_req_t *r) { build_page(); return httpd_resp_send(r, pagebuf, strlen(pagebuf)); }
 static esp_err_t to_portal(httpd_req_t *r, httpd_err_code_t err) {
     httpd_resp_set_status(r, "303 See Other");
     httpd_resp_set_hdr(r, "Location", "http://" ADDR "/");
-    return httpd_resp_sendstr(r, "Badge security scan: http://" ADDR "/");
+    return httpd_resp_sendstr(r, "Badge risk scoreboard: http://" ADDR "/");
 }
 
-static void draw_report(void) {
+// ---- e-ink: the leaderboard (risk score + ports), or the ZTLP ad when idle ----
+static void draw_leaderboard(void) {
     memset(fb, 0, sizeof fb);
-    int live = 0, risk = 0;
-    for (int i=0;i<MAXC;i++) if (cl[i].known) { live++; if (cl[i].at_risk) risk++; }
-    const char *v = risk ? "AT RISK" : "SECURE";
-    text((W - (int)strlen(v)*40)/2, TOP+40, 5, v, risk);
-    text(48, TOP+150, 3, "Devices on this badge:", true);
-    int y = TOP+190, shown = 0;
-    for (int i=0;i<MAXC && shown<6;i++) {
-        if (!cl[i].known) continue;
-        char ip[16], line[80];
+    text(48, TOP+34, 4, "RISK SCOREBOARD", true);
+    int y = TOP+96, rank = 0;
+    for (int r = 0; r < 6 && rank < 6; r++) {
+        int i = leader_idx(rank);
+        if (i < 0) break;
+        rank++;
+        char ip[16], line[90], ports[64];
         ip_str(cl[i].ip, ip);
-        snprintf(line, sizeof line, "%s  %d open%s", ip, cl[i].n_open, cl[i].at_risk ? " !":"");
-        text(48, y, 3, line, cl[i].at_risk);
-        if (cl[i].n_open) {
-            char ports[64] = "ports: ";
-            for (int k=0;k<cl[i].n_open && k<6;k++)
-                snprintf(ports+strlen(ports), 64-strlen(ports), "%d ", cl[i].open[k]);
-            text(80, y+34, 2, ports, true);
+        snprintf(line, sizeof line, "#%d  %d  %s", rank, cl[i].score, ip);
+        // risk color: red high / (no red on 3-colour panel -> use black, but mark risk)
+        int red = cl[i].score >= 40;
+        text(48, y, 3, line, red);
+        snprintf(ports, sizeof ports, "open: ");
+        int k = 0;
+        for (int j = 0; j < cl[i].n_open && k < 6; j++) {
+            snprintf(ports + strlen(ports), 64 - strlen(ports), "%d ", cl[i].open[j]);
+            k++;
         }
-        y += 70; shown++;
+        if (!k) strcpy(ports, "open: none");
+        text(80, y + 32, 2, ports, false);
+        y += 74;
     }
-    if (!live) {
-        text(48, y, 3, "No devices connected yet.", true);
-        text(48, y+40, 2, "Join the open AP from your phone.", true);
-        text(48, y+70, 2, "The scan page opens by itself.", true);
+    if (!rank) {
+        text(48, y + 20, 3, "No devices on this badge yet.", true);
     }
     ui_frame(1);
+}
+
+static void draw_ztlp_ad(void) {
+    memset(fb, 0, sizeof fb);
+    // banner
+    box(0, TOP, W, 8, true);
+    box(0, TOP+120, W, 4, true);
+    text((W - (int)strlen("ZTLP"))*1/2, TOP+40, 8, "ZTLP", true);
+    text((W - (int)strlen("Secure Identity-First Network Overlay"))/2, TOP+150, 2,
+         "Secure Identity-First Network Overlay", true);
+    // the pitch
+    int y = TOP+210;
+    text(48, y,   3, "Minimize your attack surface.", true);
+    y += 56;
+    text(48, y,   2, "ZTLP authenticates every device before it gets network access.", true);
+    y += 34;
+    text(48, y,   2, "Unauthorized traffic is rejected before it costs anything.", true);
+    y += 34;
+    text(48, y,   2, "Legitimate connectivity stays private by default.", true);
+    y += 60;
+    text(48, y,   2, "Connect to this badge to see the live risk", true);
+    y += 30;
+    text(48, y,   2, "scoreboard of the devices on the network.", true);
+    ui_frame(1);
+}
+
+static void draw_screen(void) {
+    int live = 0;
+    for (int i=0;i<MAXC;i++) if (cl[i].known) live++;
+    if (live) draw_leaderboard();
+    else      draw_ztlp_ad();
 }
 
 void app_scanner(void)
@@ -207,7 +264,7 @@ void app_scanner(void)
             for (int i=0;i<MAXC;i++) if (cl[i].known) scan_client(&cl[i]);
             last_scan = t;
         }
-        if (t - last_draw > 1500) { draw_report(); last_draw = t; }
+        if (t - last_draw > 1500) { draw_screen(); last_draw = t; }
         if (btn_held() & (1<<BTN_A)) last_scan = 0;
         if (btn_held() & (1<<BTN_B)) break;
         ms(500);
